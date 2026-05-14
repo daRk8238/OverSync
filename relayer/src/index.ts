@@ -259,7 +259,7 @@ export const RELAYER_CONFIG = {
   enableMockMode: process.env.ENABLE_MOCK_MODE === 'true',
   debug: process.env.DEBUG === 'true',
   resolverAllowlist: parseCsv(process.env.RELAYER_RESOLVER_ADDRESSES),
-  rpcTimeoutMs: Number(process.env.RELAYER_RPC_TIMEOUT_MS) || 8000,
+  rpcTimeoutMs: Number(process.env.RELAYER_RPC_TIMEOUT_MS) || 30000,
   
   // Ethereum configuration
   ethereum: {
@@ -1853,11 +1853,103 @@ const activeOrders = new Map();
           stack: ethError.stack,
           data: ethError.data
         });
+
+        // 🆘 AUTOMATIC XLM REFUND: User sent XLM but we couldn't send ETH.
+        // Refund the XLM back to the user to prevent fund loss.
+        let refundResult: any = null;
+        let refundError: any = null;
+
+        try {
+          console.log('🔄 Attempting automatic XLM refund to user...');
+          console.log('🎯 Refunding to stellar address:', stellarAddress);
+
+          const { Horizon, Keypair, Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } = await import('@stellar/stellar-sdk');
+
+          const networkModeForRefund = requestNetwork || storedOrder?.networkMode || DEFAULT_NETWORK_MODE;
+          const stellarRefundConfig = NETWORK_CONFIG[networkModeForRefund === 'mainnet' ? 'mainnet' : 'testnet'].stellar;
+          const refundServer = new Horizon.Server(stellarRefundConfig.horizonUrl);
+
+          const refundSecretKey = networkModeForRefund === 'mainnet'
+            ? (process.env.RELAYER_STELLAR_SECRET_MAINNET || process.env.RELAYER_STELLAR_SECRET)
+            : (process.env.RELAYER_STELLAR_SECRET_TESTNET || process.env.RELAYER_STELLAR_SECRET);
+
+          if (!refundSecretKey) {
+            throw new Error(`Relayer Stellar secret not configured for ${networkModeForRefund}`);
+          }
+
+          const refundKeypair = Keypair.fromSecret(refundSecretKey);
+          const refundAccount = await refundServer.loadAccount(refundKeypair.publicKey());
+
+          // Look up original XLM transaction to determine refund amount
+          let refundXlmAmount: string;
+          try {
+            const originalTx = await refundServer.transactions().transaction(stellarTxHash).call();
+            const ops = await refundServer.operations().forTransaction(stellarTxHash).call();
+            const paymentOp: any = ops.records.find((op: any) =>
+              op.type === 'payment' &&
+              op.to === refundKeypair.publicKey() &&
+              op.asset_type === 'native'
+            );
+
+            if (paymentOp) {
+              // Refund 99.99% to cover stellar tx fees (~0.00001 XLM)
+              const original = parseFloat(paymentOp.amount);
+              refundXlmAmount = (original - 0.0001).toFixed(7);
+              console.log(`💰 Original XLM amount: ${paymentOp.amount}, refunding: ${refundXlmAmount}`);
+            } else {
+              throw new Error('Could not find original XLM payment in transaction');
+            }
+          } catch (lookupErr: any) {
+            console.warn('⚠️ Could not look up original XLM amount, using order amount as fallback');
+            // Fallback: use order amount if available
+            refundXlmAmount = storedOrder?.amount ? String(storedOrder.amount) : '0.1';
+          }
+
+          const networkPassphraseForRefund = networkModeForRefund === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+          const refundPayment = Operation.payment({
+            destination: stellarAddress,
+            asset: Asset.native(),
+            amount: refundXlmAmount
+          });
+
+          const refundTransaction = new TransactionBuilder(refundAccount, {
+            fee: BASE_FEE,
+            networkPassphrase: networkPassphraseForRefund
+          })
+            .addOperation(refundPayment)
+            .addMemo(Memo.text(`Refund:${(orderId || 'unknown').substring(0, 20)}`))
+            .setTimeout(300)
+            .build();
+
+          refundTransaction.sign(refundKeypair);
+          refundResult = await refundServer.submitTransaction(refundTransaction);
+          console.log('✅ Automatic XLM refund successful:', refundResult.hash);
+
+          if (storedOrder) {
+            storedOrder.status = 'refunded';
+            storedOrder.refundTxHash = refundResult.hash;
+          }
+        } catch (refundErr: any) {
+          console.error('❌ Automatic XLM refund failed:', refundErr);
+          refundError = refundErr.message || 'Refund failed';
+        }
+
         res.status(500).json({
           error: 'ETH release failed',
           details: ethError.message,
           errorCode: ethError.code,
-          errorName: ethError.name
+          errorName: ethError.name,
+          refund: refundResult ? {
+            status: 'completed',
+            stellarTxHash: refundResult.hash,
+            message: 'Your XLM has been automatically refunded to your wallet.'
+          } : {
+            status: 'failed',
+            error: refundError,
+            message: 'Automatic refund failed. Please contact support with this order ID.',
+            orderId,
+            originalStellarTxHash: stellarTxHash
+          }
         });
       }
 
@@ -1877,8 +1969,127 @@ const activeOrders = new Map();
     }
   });
 
+  // POST /api/orders/manual-refund - Manual XLM refund for failed XLM→ETH orders
+  // Allows users to recover XLM that was sent but ETH could not be released
+  app.post('/api/orders/manual-refund', async (req, res) => {
+    try {
+      const { stellarTxHash, stellarAddress, networkMode } = req.body;
+
+      if (!stellarTxHash || !stellarAddress) {
+        return res.status(400).json({
+          error: 'Missing required fields: stellarTxHash, stellarAddress'
+        });
+      }
+
+      const refundNetwork = networkMode || DEFAULT_NETWORK_MODE;
+      console.log('🆘 Manual refund requested:', { stellarTxHash, stellarAddress, refundNetwork });
+
+      const { Horizon, Keypair, Asset, Operation, TransactionBuilder, Networks, BASE_FEE, Memo } = await import('@stellar/stellar-sdk');
+
+      const stellarConfig = NETWORK_CONFIG[refundNetwork === 'mainnet' ? 'mainnet' : 'testnet'].stellar;
+      const server = new Horizon.Server(stellarConfig.horizonUrl);
+
+      const relayerSecretKey = refundNetwork === 'mainnet'
+        ? (process.env.RELAYER_STELLAR_SECRET_MAINNET || process.env.RELAYER_STELLAR_SECRET)
+        : (process.env.RELAYER_STELLAR_SECRET_TESTNET || process.env.RELAYER_STELLAR_SECRET);
+
+      if (!relayerSecretKey) {
+        return res.status(500).json({
+          error: 'Relayer Stellar secret not configured',
+          network: refundNetwork
+        });
+      }
+
+      const relayerKeypair = Keypair.fromSecret(relayerSecretKey);
+      const relayerPublicKey = relayerKeypair.publicKey();
+
+      // Verify the original transaction was actually sent to this relayer
+      let refundAmount: string;
+      try {
+        const ops = await server.operations().forTransaction(stellarTxHash).call();
+        const paymentOp: any = ops.records.find((op: any) =>
+          op.type === 'payment' &&
+          op.to === relayerPublicKey &&
+          op.asset_type === 'native' &&
+          op.from === stellarAddress
+        );
+
+        if (!paymentOp) {
+          return res.status(400).json({
+            error: 'Original transaction does not match a payment from this stellar address to the relayer',
+            details: 'The tx hash must be a native XLM payment from your stellar address to the relayer wallet'
+          });
+        }
+
+        refundAmount = (parseFloat(paymentOp.amount) - 0.0001).toFixed(7);
+        console.log(`💰 Verified payment: ${paymentOp.amount} XLM, refunding ${refundAmount}`);
+      } catch (lookupErr: any) {
+        return res.status(404).json({
+          error: 'Could not verify original transaction',
+          details: lookupErr.message
+        });
+      }
+
+      // Check if this refund was already processed
+      try {
+        const transactions = await server.transactions().forAccount(relayerPublicKey).order('desc').limit(50).call();
+        const alreadyRefunded = transactions.records.some((tx: any) => {
+          return tx.memo === `Refund:${stellarTxHash.substring(0, 20)}` ||
+                 tx.memo === `ManualRefund:${stellarTxHash.substring(0, 20)}`;
+        });
+        if (alreadyRefunded) {
+          return res.status(409).json({
+            error: 'Refund already processed for this transaction',
+            stellarTxHash
+          });
+        }
+      } catch (e) {
+        console.warn('Could not check refund history, proceeding anyway:', e);
+      }
+
+      // Build and send refund transaction
+      const relayerAccount = await server.loadAccount(relayerPublicKey);
+      const networkPassphrase = refundNetwork === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+
+      const refundPayment = Operation.payment({
+        destination: stellarAddress,
+        asset: Asset.native(),
+        amount: refundAmount
+      });
+
+      const tx = new TransactionBuilder(relayerAccount, {
+        fee: BASE_FEE,
+        networkPassphrase
+      })
+        .addOperation(refundPayment)
+        .addMemo(Memo.text(`ManualRefund:${stellarTxHash.substring(0, 20)}`))
+        .setTimeout(300)
+        .build();
+
+      tx.sign(relayerKeypair);
+      const result = await server.submitTransaction(tx);
+      console.log('✅ Manual refund successful:', result.hash);
+
+      res.json({
+        success: true,
+        refundTxHash: result.hash,
+        amount: refundAmount,
+        destination: stellarAddress,
+        network: refundNetwork,
+        message: 'XLM successfully refunded to your wallet'
+      });
+    } catch (err: any) {
+      console.error('❌ Manual refund failed:', err);
+      res.status(500).json({
+        error: 'Manual refund failed',
+        details: err.message,
+        errorName: err.name
+      });
+    }
+  });
+
   console.log('📍 DEBUG: Orders endpoints registered successfully');
-  
+
   // Phase 6.5: EscrowFactory Event Listening
   console.log('🏭 Setting up EscrowFactory event listeners...');
   

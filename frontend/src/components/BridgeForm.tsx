@@ -928,19 +928,50 @@ export default function BridgeForm({ ethAddress, stellarAddress }: BridgeFormPro
               console.error('❌ Error response body:', errorData);
               
               // Try to parse error details
+              let parsedError: any = null;
               try {
-                const errorJson = JSON.parse(errorData);
-                console.error('❌ Parsed error details:', errorJson);
+                parsedError = JSON.parse(errorData);
+                console.error('❌ Parsed error details:', parsedError);
               } catch (parseError) {
                 console.error('❌ Could not parse error response as JSON');
               }
               
-              // Update status to failed
-              setStatusMessage('ETH sending failed ❌');
-              setIsSubmitting(false);
-              
-              // Show error to user
-              alert(`ETH sending failed: ${processResponse.status} - ${errorData}`);
+              // Check if automatic refund was processed by backend
+              if (parsedError?.refund?.status === 'completed') {
+                console.log('✅ Automatic refund completed:', parsedError.refund.stellarTxHash);
+                
+                // Update transaction to show refund
+                updateTransactionStatus(result.orderId, 'cancelled', {
+                  stellarTxHash: parsedError.refund.stellarTxHash,
+                  refundedAt: Date.now()
+                });
+                
+                setStatusMessage('Refunded ↩️');
+                setIsSubmitting(false);
+                
+                alert(
+                  `ETH transfer failed, but your XLM has been automatically refunded to your wallet.\n\n` +
+                  `Refund TX: ${parsedError.refund.stellarTxHash}\n\n` +
+                  `Reason: ${parsedError.details || 'Unknown'}`
+                );
+              } else {
+                // Refund failed or not attempted - inform user with manual refund instructions
+                console.error('❌ Automatic refund failed:', parsedError?.refund);
+                
+                updateTransactionStatus(result.orderId, 'failed');
+                
+                setStatusMessage('Failed ❌');
+                setIsSubmitting(false);
+                
+                const refundInfo = parsedError?.refund 
+                  ? `\n\nAutomatic refund failed: ${parsedError.refund.error}\n\n` +
+                    `To recover your XLM, contact support with:\n` +
+                    `- Stellar TX: ${submitResult.hash}\n` +
+                    `- Stellar Address: ${stellarAddress}`
+                  : '';
+                
+                alert(`ETH sending failed: ${parsedError?.details || errorData}${refundInfo}`);
+              }
             }
           } catch (processError: any) {
             console.error('❌ ETH release network error:', processError);
