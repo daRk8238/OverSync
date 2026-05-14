@@ -209,12 +209,14 @@ export default function BridgeForm({ ethAddress, stellarAddress }: BridgeFormPro
   
   // Real-time exchange rate state.
   //
-  // Quotes come from the relayer's /api/prices endpoint (which itself proxies
-  // CoinGecko with a 60s cache). We deliberately do NOT call CoinGecko from
-  // the browser any more — that path is blocked by CORS in production and
-  // used to silently fall back to a hardcoded 10,000 XLM/ETH rate, which
-  // diverged from what the relayer actually settled at swap time. That is the
-  // bug behind "I expected 0.07 ETH but only got 0.024 ETH" reports.
+  // Quotes come from the relayer's /api/prices endpoint, which proxies
+  // CoinGecko through a stale-while-revalidate cache (fresh for 15s, served
+  // stale up to 60s while a background refresh runs). We deliberately do NOT
+  // call CoinGecko from the browser any more — that path is blocked by CORS
+  // in production and used to silently fall back to a hardcoded 10,000
+  // XLM/ETH rate, which diverged from what the relayer actually settled at
+  // swap time. That is the bug behind "I expected 0.07 ETH but only got
+  // 0.024 ETH" reports.
   const [exchangeRate, setExchangeRate] = useState<number>(ETH_TO_XLM_RATE);
   const [xlmUsdPrice, setXlmUsdPrice] = useState<number | null>(null);
   const [ethUsdPrice, setEthUsdPrice] = useState<number | null>(null);
@@ -1344,7 +1346,7 @@ export default function BridgeForm({ ethAddress, stellarAddress }: BridgeFormPro
                 <span className="mx-1.5 text-gray-600">·</span>
                 XLM ${xlmUsdPrice.toLocaleString(undefined, { maximumFractionDigits: 4 })}
                 <span className="mx-1.5 text-gray-600">·</span>
-                via relayer (CoinGecko, 60s cache)
+                via relayer (CoinGecko, 15s SWR)
               </div>
             )}
             {priceSource === 'fallback' && (

@@ -180,15 +180,24 @@ const ETH_TO_XLM_RATE = 10000; // 1 ETH = 10,000 XLM (LEGACY - now using real-ti
 // Network-aware contract addresses  
 const HTLC_CONTRACT_ADDRESS = getHtlcBridgeAddress(); // Dynamic: testnet/mainnet
 
-// Real-time price fetching function with in-memory cache.
+// Real-time price fetching with two-tier in-memory cache.
 //
-// CoinGecko's public API is aggressive about rate limits (~10-30 calls/min from
-// a single IP), and every swap path on the relayer needs the same prices. We
-// also serve them to the frontend via /api/prices, so without caching a busy
-// page would burn through the quota in seconds and start returning fallback
-// values. PRICE_CACHE_TTL_MS keeps a fresh quote for 60s, which is well within
-// the precision needed for a quote-then-confirm UX and matches what
-// market-data providers consider "real time" for retail dashboards.
+// CoinGecko's free public API is aggressive about rate limits (~10-30 calls/min
+// per IP), so we cannot hit it on every quote. But a flat 60s cache feels
+// stale in a crypto UX — most DEX aggregators refresh visible prices every
+// 10-20s. We split the difference with a stale-while-revalidate (SWR) cache:
+//
+//   - Within FRESH_MS (15s): serve cached data, no upstream call.
+//   - Within STALE_MS (60s): serve cached data immediately AND kick off a
+//     background refresh so the next caller gets a fresher snapshot.
+//   - Past STALE_MS: callers wait for a fresh fetch (de-duped via inflight
+//     promise so a burst of swaps doesn't fan out to multiple CoinGecko calls).
+//
+// Net effect: the UI feels live (refreshes within ~15s of any user activity)
+// while CoinGecko calls stay bounded to at most one every ~15s under load.
+// Crucially, both the frontend quote and the relayer's settlement use this
+// same cache, so the price a user is quoted matches the price they settle at
+// for the duration of a single cache window.
 interface PriceSnapshot {
   xlmUsdPrice: number;
   ethUsdPrice: number;
@@ -197,7 +206,8 @@ interface PriceSnapshot {
   source: 'coingecko' | 'fallback' | 'cache';
 }
 
-const PRICE_CACHE_TTL_MS = 60_000;
+const PRICE_CACHE_FRESH_MS = 15_000;
+const PRICE_CACHE_STALE_MS = 60_000;
 let cachedPrices: PriceSnapshot | null = null;
 let inflightPriceFetch: Promise<PriceSnapshot> | null = null;
 
@@ -239,21 +249,60 @@ async function fetchPricesFromCoinGecko(): Promise<PriceSnapshot> {
   }
 }
 
-async function getPriceSnapshot(): Promise<PriceSnapshot> {
-  const now = Date.now();
-  if (cachedPrices && now - cachedPrices.fetchedAt < PRICE_CACHE_TTL_MS) {
-    return { ...cachedPrices, source: 'cache' };
-  }
-  // De-dupe concurrent fetches so a burst of swap requests does not fan out
-  // to multiple CoinGecko calls in the same tick.
-  if (!inflightPriceFetch) {
-    inflightPriceFetch = fetchPricesFromCoinGecko().finally(() => {
+function triggerBackgroundRefresh(): void {
+  if (inflightPriceFetch) return;
+  inflightPriceFetch = fetchPricesFromCoinGecko()
+    .then((snapshot) => {
+      cachedPrices = snapshot;
+      return snapshot;
+    })
+    .catch((err) => {
+      // SWR background refresh; keep the stale entry. We log so an outage is
+      // visible but never propagate the error to the caller serving stale.
+      console.warn('⚠️ Background price refresh failed; keeping stale entry:', err?.message ?? err);
+      return cachedPrices ?? {
+        xlmUsdPrice: 0.12,
+        ethUsdPrice: 3500,
+        ethToXlmRate: 3500 / 0.12,
+        fetchedAt: Date.now(),
+        source: 'fallback' as const,
+      };
+    })
+    .finally(() => {
       inflightPriceFetch = null;
     });
+}
+
+async function getPriceSnapshot(): Promise<PriceSnapshot> {
+  const now = Date.now();
+
+  if (cachedPrices) {
+    const age = now - cachedPrices.fetchedAt;
+    if (age < PRICE_CACHE_FRESH_MS) {
+      // Fully fresh — serve cached, do nothing else.
+      return { ...cachedPrices, source: 'cache' };
+    }
+    if (age < PRICE_CACHE_STALE_MS) {
+      // Stale-but-acceptable — serve cached, refresh in background so the
+      // next caller sees fresher data without blocking this one.
+      triggerBackgroundRefresh();
+      return { ...cachedPrices, source: 'cache' };
+    }
   }
-  const snapshot = await inflightPriceFetch;
-  cachedPrices = snapshot;
-  return snapshot;
+
+  // No cache or beyond STALE — must block on a fresh fetch. De-dupe concurrent
+  // callers so a burst of swap requests collapses into a single CoinGecko hit.
+  if (!inflightPriceFetch) {
+    inflightPriceFetch = fetchPricesFromCoinGecko()
+      .then((snapshot) => {
+        cachedPrices = snapshot;
+        return snapshot;
+      })
+      .finally(() => {
+        inflightPriceFetch = null;
+      });
+  }
+  return inflightPriceFetch;
 }
 
 async function getRealTimePrices(): Promise<{xlmUsdPrice: number, ethUsdPrice: number, ethToXlmRate: number}> {
@@ -559,7 +608,9 @@ const activeOrders = new Map();
         xlmPerEth: snapshot.ethToXlmRate,
         source: snapshot.source,
         fetchedAt: snapshot.fetchedAt,
-        cacheTtlMs: PRICE_CACHE_TTL_MS,
+        // SWR window — UI can hint to users when a refresh is due.
+        cacheFreshMs: PRICE_CACHE_FRESH_MS,
+        cacheStaleMs: PRICE_CACHE_STALE_MS,
       });
     } catch (err: any) {
       res.status(503).json({
