@@ -33,7 +33,7 @@ export default defineConfig(({ mode }) => {
         }
       : {},
     build: {
-      outDir: '../dist',
+      outDir: 'dist',
       emptyOutDir: true,
       // Disable inline source maps in production to avoid handing reviewers
       // a fully reconstructable source tree from the public bundle.
