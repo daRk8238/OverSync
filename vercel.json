@@ -1,8 +1,7 @@
 {
-  "buildCommand": "pnpm install --no-frozen-lockfile && pnpm --filter @oversync/sdk build && pnpm --filter @oversync/frontend build",
+  "buildCommand": "pnpm install --no-frozen-lockfile && pnpm --filter @oversync/sdk build && pnpm --filter @oversync/frontend build && mkdir -p frontend/dist && cp -r dist/. frontend/dist/ && echo '--- dist contents ---' && ls -la dist/ && echo '--- frontend/dist contents ---' && ls -la frontend/dist/",
   "outputDirectory": "dist",
   "installCommand": "npm install -g pnpm@latest",
-  "framework": null,
   "rewrites": [
     {
       "source": "/(.*)",
@@ -28,4 +27,4 @@
       ]
     }
   ]
-} 
+}
