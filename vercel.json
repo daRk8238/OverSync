@@ -1,5 +1,5 @@
 {
-  "buildCommand": "bash scripts/vercel-build.sh",
+  "buildCommand": "pnpm install --no-frozen-lockfile && pnpm --filter @oversync/sdk build && pnpm --filter @oversync/frontend build && mkdir -p frontend/dist && cp -r dist/. frontend/dist/",
   "outputDirectory": "dist",
   "installCommand": "npm install -g pnpm@latest",
   "rewrites": [
