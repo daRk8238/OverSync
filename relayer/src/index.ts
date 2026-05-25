@@ -525,8 +525,11 @@ async function initializeRelayer() {
   const activeOrders = new Map<string, any>();
   const chainPollers: AdaptivePollHandle[] = [];
   let escrowFactoryPoller: ContractEventPollerHandle | null = null;
+  let chainMonitoringStarted = false;
+  let chainMonitoringPromise: Promise<void> | null = null;
 
   const wakeChainPollers = (): void => {
+    if (!chainMonitoringStarted) return;
     ethereumListener.wakePolling();
     escrowFactoryPoller?.wake();
     for (const poller of chainPollers) {
@@ -534,17 +537,39 @@ async function initializeRelayer() {
     }
   };
 
-  const storeActiveOrder = (orderId: string, orderData: Record<string, unknown>): void => {
+  const storeActiveOrder = async (
+    orderId: string,
+    orderData: Record<string, unknown>
+  ): Promise<void> => {
     activeOrders.set(orderId, orderData);
+    await ensureChainMonitoring();
     wakeChainPollers();
   };
 
   configureSitePresence(RELAYER_CONFIG.visitorTtlMs);
 
+  /** Marks a browser session — does not touch Infura until a swap order exists. */
   const handleVisitorWake = (): void => {
     markVisitorPresent();
     wakeChainPollers();
   };
+
+  let ensureChainMonitoring: () => Promise<void> = async () => {
+    if (chainMonitoringStarted) return;
+    if (!chainMonitoringPromise) {
+      chainMonitoringPromise = (async () => {
+        chainMonitoringStarted = true;
+        await startChainMonitoring();
+      })().catch((err) => {
+        chainMonitoringStarted = false;
+        chainMonitoringPromise = null;
+        throw err;
+      });
+    }
+    await chainMonitoringPromise;
+  };
+
+  let startChainMonitoring: () => Promise<void> = async () => {};
   
   // Start gas price tracking
   try {
@@ -567,26 +592,9 @@ async function initializeRelayer() {
     console.error('❌ Failed to start monitoring system:', error);
   }
 
-  // Start Ethereum event listener (TESTNET ONLY)  
-  try {
-    if (DEFAULT_NETWORK_MODE === 'mainnet') {
-      console.log('🏗️ Mainnet mode: Skipping EthereumEventListener (using 1inch EscrowFactory)');
-    } else {
-      console.log('🔄 Testnet mode: Starting EthereumEventListener for HTLCBridge monitoring');
-      ethereumListener.configurePolling({
-        isActive: () => hasActiveBridgeOrders(activeOrders),
-        isAttentive: () => hasRecentVisitor(),
-      });
-      await ethereumListener.startListening();
-    }
-  } catch (error) {
-    console.error('❌ Failed to start Ethereum listener:', error);
-    // Don't exit on mainnet, only on testnet
-    if (DEFAULT_NETWORK_MODE !== 'mainnet') {
-      process.exit(1);
-    }
-  }
-  
+  // Chain listeners start lazily on the first swap order — not at boot.
+  // See `startChainMonitoring` below (zero Infura RPC while idle).
+
   // ===== ORDERS API ENDPOINTS =====
   
   // ✅ Network-aware contract logging
@@ -630,8 +638,8 @@ async function initializeRelayer() {
     res.json({ message: 'API endpoints are working!', timestamp: new Date().toISOString() });
   });
 
-  // Frontend calls this on page load so pollers stay attentive while
-  // someone is browsing (zero RPC until an order actually exists).
+  // Frontend calls this on page load — marks a browser session only.
+  // Infura RPC starts on the first swap order, not on wake.
   app.post('/api/wake', (_req, res) => {
     handleVisitorWake();
     res.status(204).end();
@@ -839,7 +847,7 @@ async function initializeRelayer() {
               contractType: 'MOCK_1INCH_ESCROW_FACTORY'
             };
             
-            storeActiveOrder(orderId, orderData);
+            await storeActiveOrder(orderId, orderData);
             
             return res.json({
               success: true,
@@ -940,7 +948,7 @@ async function initializeRelayer() {
           };
           
           // ✅ Add networkMode for XLM→ETH processing
-          storeActiveOrder(orderId, {
+          await storeActiveOrder(orderId, {
             ...orderData,
             networkMode: requestNetwork
           });
@@ -1039,7 +1047,7 @@ async function initializeRelayer() {
         };
 
         // Store order
-        storeActiveOrder(orderId, {
+        await storeActiveOrder(orderId, {
           ...orderData,
           ethAddress: normalizedEthAddress,
           stellarAddress,
@@ -1153,7 +1161,7 @@ async function initializeRelayer() {
             contractType: 'MOCK_DUAL_HTLC'
           };
           
-          storeActiveOrder(orderId, orderData);
+          await storeActiveOrder(orderId, orderData);
 
           return res.json({
             success: true,
@@ -1225,7 +1233,7 @@ async function initializeRelayer() {
           }
         };
         
-        storeActiveOrder(orderId, orderData);
+        await storeActiveOrder(orderId, orderData);
 
         res.json({
           success: true,
@@ -1804,7 +1812,7 @@ async function initializeRelayer() {
           created: new Date().toISOString(),
           networkMode: requestNetwork,
         };
-        storeActiveOrder(orderId, storedOrder);
+        await storeActiveOrder(orderId, storedOrder);
       }
       storedOrder.xlmReceivedAt = storedOrder.xlmReceivedAt ?? Date.now();
       storedOrder.stellarTxHash = stellarTxHash;
@@ -2303,8 +2311,9 @@ async function initializeRelayer() {
 
   console.log('📍 DEBUG: Orders endpoints registered successfully');
 
-  // Phase 6.5: EscrowFactory Event Listening
-  console.log('🏭 Setting up EscrowFactory event listeners...');
+  // Phase 6.5: EscrowFactory Event Listening (lazy — first swap order only)
+  startChainMonitoring = async () => {
+  console.log('🔗 Chain monitoring starting (swap order in flight)...');
   
   // Setup EscrowFactory contract instance for event listening
   try {
@@ -2768,9 +2777,20 @@ async function initializeRelayer() {
     }
 
     console.log('✅ EscrowFactory event listeners set up successfully');
+
+    if (DEFAULT_NETWORK_MODE !== 'mainnet') {
+      console.log('🔄 Starting EthereumEventListener for HTLCBridge monitoring');
+      ethereumListener.configurePolling({
+        isActive: () => hasActiveBridgeOrders(activeOrders),
+        isAttentive: () => hasRecentVisitor(),
+      });
+      await ethereumListener.startListening();
+    }
   } catch (error) {
     console.error('❌ Failed to setup EscrowFactory events:', error);
+    throw error;
   }
+  };
 
   // Admin endpoints - must be inside initializeRelayer function
   

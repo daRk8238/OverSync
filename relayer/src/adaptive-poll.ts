@@ -36,7 +36,7 @@ export function startAdaptivePoll(options: AdaptivePollOptions): AdaptivePollHan
     activeIntervalMs,
     idleIntervalMs = 120_000,
     isActive,
-    isAttentive = () => true,
+    isAttentive = () => false,
     tick,
   } = options;
   let stopped = false;
