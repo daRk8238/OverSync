@@ -8,6 +8,7 @@ import {
   type Chain
 } from "../persistence/orders-repo.js";
 import { canTransition } from "../state-machine/order-machine.js";
+import { ordersTotal } from "../metrics.js";
 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 const HEX_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
@@ -79,6 +80,7 @@ export class OrderService {
 
     const order = this.repo.announce(input as AnnounceOrderInput);
     this.log.info({ publicId: order.publicId, direction: order.direction }, "order announced");
+    ordersTotal.inc({ status: "announced" });
     return order;
   }
 
@@ -104,6 +106,7 @@ export class OrderService {
     }
     this.repo.recordSrcLock(input);
     this.log.info({ publicId: input.publicId, srcOrderId: input.orderId }, "src lock recorded");
+    ordersTotal.inc({ status: "src_locked" });
   }
 
   recordDstLock(input: {
@@ -121,6 +124,7 @@ export class OrderService {
     }
     this.repo.recordDstLock(input);
     this.log.info({ publicId: input.publicId, dstOrderId: input.orderId }, "dst lock recorded");
+    ordersTotal.inc({ status: "dst_locked" });
   }
 
   recordSecret(publicId: string, preimage: string, txHash: string): void {
@@ -131,6 +135,7 @@ export class OrderService {
     }
     this.repo.recordSecretRevealed({ publicId, preimage, txHash });
     this.log.info({ publicId }, "secret recorded");
+    ordersTotal.inc({ status: "secret_revealed" });
   }
 
   markStatus(publicId: string, status: OrderRow["status"]): void {
@@ -141,5 +146,6 @@ export class OrderService {
     }
     this.repo.setStatus(publicId, status);
     this.log.info({ publicId, status }, "status updated");
+    ordersTotal.inc({ status });
   }
 }

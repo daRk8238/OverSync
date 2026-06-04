@@ -3,6 +3,7 @@ import { sepolia, mainnet } from "viem/chains";
 import type { Logger } from "pino";
 import type { CoordinatorConfig } from "../config.js";
 import type { OrderService } from "../services/order-service.js";
+import { listenerLastBlock } from "../metrics.js";
 
 const ORDER_CREATED = parseAbiItem(
   "event OrderCreated(uint256 indexed orderId, address indexed sender, address indexed beneficiary, address token, uint256 amount, uint256 safetyDeposit, bytes32 hashlock, uint64 timelock)"
@@ -45,6 +46,9 @@ export class EthereumListener {
         event: ORDER_CREATED,
         onLogs: (logs) => {
           for (const log of logs) {
+            if (log.blockNumber != null) {
+              listenerLastBlock.set({ chain: "ethereum" }, Number(log.blockNumber));
+            }
             const hashlock = log.args.hashlock!;
             const existing = (this.orders as any).repo?.findByHashlock?.(hashlock);
             // OrderService doesn't expose direct repo access — we look up
@@ -78,6 +82,9 @@ export class EthereumListener {
         event: ORDER_CLAIMED,
         onLogs: (logs) => {
           for (const log of logs) {
+            if (log.blockNumber != null) {
+              listenerLastBlock.set({ chain: "ethereum" }, Number(log.blockNumber));
+            }
             this.log.info(
               { orderId: log.args.orderId!.toString(), preimage: log.args.preimage },
               "ETH order claimed"
@@ -96,6 +103,9 @@ export class EthereumListener {
         event: ORDER_REFUNDED,
         onLogs: (logs) => {
           for (const log of logs) {
+            if (log.blockNumber != null) {
+              listenerLastBlock.set({ chain: "ethereum" }, Number(log.blockNumber));
+            }
             this.log.info({ orderId: log.args.orderId!.toString() }, "ETH order refunded");
           }
         }
